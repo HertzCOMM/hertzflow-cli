@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { privateKeyToAccount } from 'viem/accounts';
-import { createWallet, importWallet, getKeystoreAddress, KEYSTORE_PATH, promptSecretInput } from '../wallet.js';
+import { createWallet, importWallet, exportWallet, getKeystoreAddress, KEYSTORE_PATH, promptSecretInput } from '../wallet.js';
 
 export const walletCmd = new Command('wallet').description('Wallet management');
 
@@ -10,13 +10,29 @@ walletCmd
   .description('Generate a new wallet and save to encrypted keystore')
   .action(async () => {
     try {
-      const { address, privateKey } = await createWallet();
+      const { address } = await createWallet();
       console.log(chalk.green('Wallet created successfully'));
       console.log(`Address:  ${address}`);
       console.log(`Key file: ${KEYSTORE_PATH}`);
       console.log('');
-      console.log(chalk.yellow('!! BACK UP YOUR PRIVATE KEY — it will not be shown again !!'));
-      console.log(`Private key: ${privateKey}`);
+      console.log(chalk.dim('To reveal the raw private key for backup, run: hz wallet export'));
+    } catch (e) {
+      console.error(chalk.red((e as Error).message));
+      process.exit(1);
+    }
+  });
+
+walletCmd
+  .command('export')
+  .description('Reveal the raw private key (after password unlock) — for backup only')
+  .action(async () => {
+    try {
+      console.log(chalk.yellow('!! WARNING: the private key will be printed to stdout. !!'));
+      console.log(chalk.yellow('!! Make sure no one is watching and your terminal scrollback is not recorded. !!'));
+      console.log('');
+      const pk = await exportWallet();
+      console.log(chalk.bold('Private key:'));
+      console.log(pk);
     } catch (e) {
       console.error(chalk.red((e as Error).message));
       process.exit(1);

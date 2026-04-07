@@ -30,52 +30,98 @@ const DECREASE_POSITION_SWAP_TYPE = {
   SwapCollateralTokenToPnlToken: 2,
 } as const;
 
+interface MarketEntry {
+  marketToken: `0x${string}`;
+  indexToken: `0x${string}`;
+  longToken: `0x${string}`;
+  shortToken: `0x${string}`;
+}
+
+interface SymbolMapResult {
+  markets: Map<string, MarketEntry>; // symbol (e.g. "BTC/USD") → market
+  prices: Map<string, number>; // symbol → current price (USD)
+}
+
 async function buildSymbolToMarketMap(
   client: ReturnType<typeof createReader>,
   config: ReturnType<typeof getNetworkConfig>,
-): Promise<Map<string, { marketToken: `0x${string}`; indexToken: `0x${string}`; longToken: `0x${string}`; shortToken: `0x${string}` }>> {
-  const [markets, priceRes] = await Promise.all([
+): Promise<SymbolMapResult> {
+  const [marketsRaw, priceRes] = await Promise.all([
     client.readContract({
       address: config.contracts.syntheticsReader,
       abi: syntheticsReaderAbi,
       functionName: 'getMarkets',
       args: [config.contracts.dataStore, 0n, 200n],
-    }) as any as Array<{ marketToken: `0x${string}`; indexToken: `0x${string}`; longToken: `0x${string}`; shortToken: `0x${string}` }>,
+    }) as any as Array<MarketEntry>,
     fetch(`${config.api.oracleBaseUrl}/api/v1/latestPrice?get_all=true`).then(r => r.json()) as Promise<{
-      data: { prices: Array<{ symbol: string; bsc_token_addr: string }> };
+      data: { prices: Array<{ symbol: string; bsc_token_addr: string; price: string }> };
     }>,
   ]);
 
   const addrToSymbol = new Map<string, string>();
+  const prices = new Map<string, number>();
   for (const p of priceRes.data.prices) {
     addrToSymbol.set(p.bsc_token_addr.toLowerCase(), p.symbol);
+    prices.set(p.symbol.toUpperCase(), Number(p.price));
   }
 
-  const result = new Map<string, typeof markets[0]>();
-  for (const m of markets) {
+  const markets = new Map<string, MarketEntry>();
+  for (const m of marketsRaw) {
     if (m.indexToken === ZERO_ADDRESS) continue;
     const sym = addrToSymbol.get(m.indexToken.toLowerCase());
-    if (sym) result.set(sym.toUpperCase(), m);
+    if (sym) markets.set(sym.toUpperCase(), m);
   }
-  return result;
+  return { markets, prices };
 }
 
-function findMarketBySymbol(
-  symbolMap: Map<string, ReturnType<typeof buildSymbolToMarketMap> extends Promise<Map<string, infer V>> ? V : never>,
+function resolveMarket(
+  result: SymbolMapResult,
   symbol: string,
-) {
+): { symbol: string; market: MarketEntry; price: number } {
   const upper = symbol.toUpperCase();
-  // Try exact match first (e.g. "BTC/USD")
-  const exact = symbolMap.get(upper) || symbolMap.get(`${upper}/USD`);
-  if (exact) return exact;
-  // Fuzzy match
-  for (const [key, val] of symbolMap) {
-    if (key.startsWith(upper)) return val;
+  const candidates: string[] = [];
+
+  // Exact match
+  if (result.markets.has(upper)) candidates.push(upper);
+  else if (result.markets.has(`${upper}/USD`)) candidates.push(`${upper}/USD`);
+  else {
+    // Strict prefix match: "BTC" must match "BTC/..." not "BTCB/..."
+    for (const key of result.markets.keys()) {
+      if (key === upper || key.startsWith(`${upper}/`)) candidates.push(key);
+    }
   }
-  throw new Error(`Market not found for "${symbol}". Use \`hz market list\` to see available markets.`);
+
+  if (candidates.length === 0) {
+    throw new Error(`Market not found for "${symbol}". Use \`hz market list\` to see available markets.`);
+  }
+  if (candidates.length > 1) {
+    throw new Error(`Ambiguous symbol "${symbol}". Matches: ${candidates.join(', ')}. Use the full symbol (e.g. "${candidates[0]}").`);
+  }
+
+  const matched = candidates[0]!;
+  const market = result.markets.get(matched)!;
+  const price = result.prices.get(matched);
+  if (!price || price <= 0) {
+    throw new Error(`No live price for ${matched}. Cannot compute slippage protection.`);
+  }
+  return { symbol: matched, market, price };
 }
 
-function validateTradeParams(leverage: number, collateral: number): void {
+/**
+ * Compute acceptablePrice with slippage tolerance, in 30-decimal USD.
+ * For LONG: acceptablePrice = price * (1 + slippage) — willing to BUY at higher
+ * For SHORT: acceptablePrice = price * (1 - slippage) — willing to SELL at lower
+ */
+function computeAcceptablePrice(currentPriceUsd: number, isLong: boolean, slippageBps: number): bigint {
+  const slippageMultiplier = isLong
+    ? 1 + slippageBps / 10_000
+    : 1 - slippageBps / 10_000;
+  const target = currentPriceUsd * slippageMultiplier;
+  // Convert to 30-decimal fixed point. Use string to avoid float precision loss.
+  return parseUnits(target.toFixed(18), 30);
+}
+
+function validateTradeParams(leverage: number, collateral: number, slippageBps: number): void {
   if (!Number.isFinite(leverage) || leverage < 1.1) {
     throw new Error(`Invalid leverage: ${leverage}. Must be >= 1.1`);
   }
@@ -84,6 +130,9 @@ function validateTradeParams(leverage: number, collateral: number): void {
   }
   if (!Number.isFinite(collateral) || collateral < 10) {
     throw new Error(`Collateral must be at least 10 USDT (got ${collateral}).`);
+  }
+  if (!Number.isFinite(slippageBps) || slippageBps < 0 || slippageBps > 1000) {
+    throw new Error(`Slippage ${slippageBps}bps out of range. Must be 0–1000 bps (0–10%).`);
   }
 }
 
@@ -104,8 +153,9 @@ async function openPosition(
   isLong: boolean,
   leverage: number,
   collateralUsdt: number,
+  slippageBps: number,
 ) {
-  validateTradeParams(leverage, collateralUsdt);
+  validateTradeParams(leverage, collateralUsdt, slippageBps);
 
   const network = (tradeCmd.parent?.opts() as { network?: string })?.network as NetworkName || 'testnet';
   const config = getNetworkConfig(network);
@@ -113,16 +163,23 @@ async function openPosition(
   const reader = createReader(config);
   const writer = createWriter(config, account);
 
-  console.log(chalk.dim(`Finding ${symbol} market...`));
+  console.log(chalk.dim(`Resolving ${symbol} market...`));
   const symbolMap = await buildSymbolToMarketMap(reader, config);
-  const market = findMarketBySymbol(symbolMap, symbol);
+  const { symbol: matchedSymbol, market, price: currentPrice } = resolveMarket(symbolMap, symbol);
 
   const collateralAmount = parseUnits(collateralUsdt.toString(), 6);
   const sizeDeltaUsd = parseUnits((collateralUsdt * leverage).toString(), 30);
+  const acceptablePrice = computeAcceptablePrice(currentPrice, isLong, slippageBps);
 
-  const acceptablePrice = isLong
-    ? parseUnits('999999999', 30)
-    : 1n;
+  // Show user what's about to happen — this is the only confirmation
+  console.log('');
+  console.log(chalk.bold(`${isLong ? 'LONG' : 'SHORT'} ${matchedSymbol}`));
+  console.log(`  Market token:    ${market.marketToken}`);
+  console.log(`  Mark price:      $${currentPrice.toLocaleString(undefined, { maximumFractionDigits: 6 })}`);
+  console.log(`  Acceptable:      $${(currentPrice * (isLong ? 1 + slippageBps / 10_000 : 1 - slippageBps / 10_000)).toLocaleString(undefined, { maximumFractionDigits: 6 })} (${slippageBps}bps slippage)`);
+  console.log(`  Size:            $${(collateralUsdt * leverage).toLocaleString()} (${leverage}x)`);
+  console.log(`  Collateral:      ${collateralUsdt} USDT`);
+  console.log('');
 
   const orderParams = {
     addresses: {
@@ -191,15 +248,18 @@ async function openPosition(
 
 export const tradeCmd = new Command('trade').description('Open and close positions');
 
+const DEFAULT_SLIPPAGE_BPS = 50; // 0.5%
+
 tradeCmd
   .command('long')
   .description('Open a long position')
   .argument('<symbol>', 'Token symbol (e.g. BTC, ETH)')
   .argument('<leverage>', 'Leverage multiplier (e.g. 10, 50, 100)')
   .argument('<collateral>', 'Collateral amount in USDT (min 10)')
-  .action(async (symbol: string, leverage: string, collateral: string) => {
+  .option('--slippage <bps>', 'Slippage tolerance in basis points (default 50 = 0.5%)', String(DEFAULT_SLIPPAGE_BPS))
+  .action(async (symbol: string, leverage: string, collateral: string, opts: { slippage: string }) => {
     try {
-      await openPosition(symbol, true, Number(leverage), Number(collateral));
+      await openPosition(symbol, true, Number(leverage), Number(collateral), Number(opts.slippage));
     } catch (e) {
       console.error(chalk.red((e as Error).message));
       process.exit(1);
@@ -212,9 +272,10 @@ tradeCmd
   .argument('<symbol>', 'Token symbol (e.g. BTC, ETH)')
   .argument('<leverage>', 'Leverage multiplier')
   .argument('<collateral>', 'Collateral amount in USDT (min 10)')
-  .action(async (symbol: string, leverage: string, collateral: string) => {
+  .option('--slippage <bps>', 'Slippage tolerance in basis points (default 50 = 0.5%)', String(DEFAULT_SLIPPAGE_BPS))
+  .action(async (symbol: string, leverage: string, collateral: string, opts: { slippage: string }) => {
     try {
-      await openPosition(symbol, false, Number(leverage), Number(collateral));
+      await openPosition(symbol, false, Number(leverage), Number(collateral), Number(opts.slippage));
     } catch (e) {
       console.error(chalk.red((e as Error).message));
       process.exit(1);
@@ -228,14 +289,34 @@ tradeCmd
   .option('--long', 'Close long position')
   .option('--short', 'Close short position')
   .option('--size <usd>', 'Partial close size in USD (default: close all)')
-  .action(async (marketToken: string, opts: { long?: boolean; short?: boolean; size?: string }) => {
+  .option('--slippage <bps>', 'Slippage tolerance in basis points (default 50 = 0.5%)', String(DEFAULT_SLIPPAGE_BPS))
+  .action(async (marketToken: string, opts: { long?: boolean; short?: boolean; size?: string; slippage: string }) => {
     try {
       const isLong = opts.long ? true : opts.short ? false : (() => { throw new Error('Specify --long or --short'); })();
+      const slippageBps = Number(opts.slippage);
+      if (!Number.isFinite(slippageBps) || slippageBps < 0 || slippageBps > 1000) {
+        throw new Error(`Slippage ${slippageBps}bps out of range (0–1000).`);
+      }
       const network = (tradeCmd.parent?.opts() as { network?: string })?.network as NetworkName || 'testnet';
       const config = getNetworkConfig(network);
       const account = await loadAccount();
       const reader = createReader(config);
       const writer = createWriter(config, account);
+
+      // Look up the market's index symbol + price for slippage protection
+      const symbolMap = await buildSymbolToMarketMap(reader, config);
+      let marketSymbol: string | undefined;
+      let markPrice: number | undefined;
+      for (const [sym, m] of symbolMap.markets) {
+        if (m.marketToken.toLowerCase() === marketToken.toLowerCase()) {
+          marketSymbol = sym;
+          markPrice = symbolMap.prices.get(sym);
+          break;
+        }
+      }
+      if (!markPrice) {
+        throw new Error(`Could not resolve mark price for market ${marketToken}. Refusing to close without slippage protection.`);
+      }
 
       const positions = await reader.readContract({
         address: config.contracts.syntheticsReader,
@@ -254,7 +335,15 @@ tradeCmd
       if (!pos) throw new Error('Position not found. Use `hz position list` to check open positions.');
 
       const sizeDeltaUsd = opts.size ? parseUnits(opts.size, 30) : pos.numbers.sizeInUsd;
-      const acceptablePrice = isLong ? 1n : parseUnits('999999999', 30);
+      // Closing a LONG = selling (accept lower price). Closing a SHORT = buying back (accept higher price).
+      const acceptablePrice = computeAcceptablePrice(markPrice, !isLong, slippageBps);
+
+      console.log('');
+      console.log(chalk.bold(`CLOSE ${isLong ? 'LONG' : 'SHORT'} ${marketSymbol ?? marketToken}`));
+      console.log(`  Mark price:   $${markPrice.toLocaleString(undefined, { maximumFractionDigits: 6 })}`);
+      console.log(`  Size:         ${opts.size ? `$${opts.size}` : 'FULL'}`);
+      console.log(`  Slippage:     ${slippageBps}bps`);
+      console.log('');
 
       const orderParams = {
         addresses: {
