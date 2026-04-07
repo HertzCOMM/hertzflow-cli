@@ -6,7 +6,7 @@ import { createReader, createWriter } from '../client.js';
 import { exchangeRouterAbi } from '../abi/exchange-router.js';
 import { syntheticsReaderAbi } from '../abi/reader.js';
 import { erc20Abi } from '../abi/erc20.js';
-import { loadAccount } from '../wallet.js';
+import { loadAccount, promptConfirm } from '../wallet.js';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as `0x${string}`;
 const ZERO_BYTES32 = '0x0000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
@@ -125,8 +125,8 @@ function validateTradeParams(leverage: number, collateral: number, slippageBps: 
   if (!Number.isFinite(leverage) || leverage < 1.1) {
     throw new Error(`Invalid leverage: ${leverage}. Must be >= 1.1`);
   }
-  if (leverage > 1000) {
-    throw new Error(`Leverage ${leverage}x exceeds max 1000x.`);
+  if (leverage > 100) {
+    throw new Error(`Leverage ${leverage}x exceeds CLI cap of 100x. (HertzFlow's max is asset-class-dependent; raise the cap in src/commands/trade.ts if you know what you're doing.)`);
   }
   if (!Number.isFinite(collateral) || collateral < 10) {
     throw new Error(`Collateral must be at least 10 USDT (got ${collateral}).`);
@@ -171,7 +171,7 @@ async function openPosition(
   const sizeDeltaUsd = parseUnits((collateralUsdt * leverage).toString(), 30);
   const acceptablePrice = computeAcceptablePrice(currentPrice, isLong, slippageBps);
 
-  // Show user what's about to happen — this is the only confirmation
+  // Show user what's about to happen and require explicit confirmation
   console.log('');
   console.log(chalk.bold(`${isLong ? 'LONG' : 'SHORT'} ${matchedSymbol}`));
   console.log(`  Market token:    ${market.marketToken}`);
@@ -179,7 +179,14 @@ async function openPosition(
   console.log(`  Acceptable:      $${(currentPrice * (isLong ? 1 + slippageBps / 10_000 : 1 - slippageBps / 10_000)).toLocaleString(undefined, { maximumFractionDigits: 6 })} (${slippageBps}bps slippage)`);
   console.log(`  Size:            $${(collateralUsdt * leverage).toLocaleString()} (${leverage}x)`);
   console.log(`  Collateral:      ${collateralUsdt} USDT`);
+  console.log(`  Network:         ${network}`);
   console.log('');
+
+  const confirmed = await promptConfirm('Submit this order?');
+  if (!confirmed) {
+    console.log(chalk.dim('Aborted.'));
+    return;
+  }
 
   const orderParams = {
     addresses: {
@@ -340,10 +347,18 @@ tradeCmd
 
       console.log('');
       console.log(chalk.bold(`CLOSE ${isLong ? 'LONG' : 'SHORT'} ${marketSymbol ?? marketToken}`));
+      console.log(`  Market token: ${marketToken}`);
       console.log(`  Mark price:   $${markPrice.toLocaleString(undefined, { maximumFractionDigits: 6 })}`);
       console.log(`  Size:         ${opts.size ? `$${opts.size}` : 'FULL'}`);
       console.log(`  Slippage:     ${slippageBps}bps`);
+      console.log(`  Network:      ${network}`);
       console.log('');
+
+      const confirmed = await promptConfirm('Submit close order?');
+      if (!confirmed) {
+        console.log(chalk.dim('Aborted.'));
+        return;
+      }
 
       const orderParams = {
         addresses: {

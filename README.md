@@ -76,9 +76,10 @@ hz trade short <symbol> <leverage> <collateral-usdt> [--slippage <bps>]
 hz trade close <market-token> --long|--short [--size <usd>] [--slippage <bps>]
 ```
 
-- `leverage` — 1.1 to 1000 (per asset class — see HertzFlow docs)
+- `leverage` — 1.1 to **100** (CLI cap; HertzFlow's per-asset cap may be higher — raise the constant in `src/commands/trade.ts` if you really need it)
 - `collateral` — minimum 10 USDT
 - `--slippage` — basis points, default `50` (0.5%), max `1000` (10%)
+- **Every `trade long/short/close` prints the order details and asks `[y/N]` before signing.** Bypass with `HZ_YES=1` for non-interactive scripts.
 - All commands support `--json` for agent / script integration
 - All commands support `-n testnet | mainnet` (mainnet currently disabled)
 
@@ -103,6 +104,19 @@ The CLI supports two key sources:
 
 > ⚠️ This keystore is **not** Ethereum standard keystore v3 (geth/MetaMask use scrypt + Keccak). It cannot be imported into other wallets directly. Use `hz wallet export` to recover the raw private key, then re-import it elsewhere.
 
+### Migrating a legacy keystore
+
+Keystores created before commit `0aaaaa8` use 100 000 PBKDF2 iterations and a single key for both encryption and HMAC. The CLI still decrypts them but prints a warning on every invocation. To migrate:
+
+```bash
+hz wallet export                                        # paste current password, copy the printed key
+mv ~/.hertzflow/keystore.json ~/.hertzflow/keystore.legacy.json
+hz wallet import                                        # paste the key, set a fresh password
+rm ~/.hertzflow/keystore.legacy.json                    # only after verifying `hz wallet show`
+```
+
+Set `HZ_SUPPRESS_LEGACY_WARN=1` to silence the warning if you cannot migrate yet.
+
 ### `HZ_PRIVATE_KEY` warnings
 
 Setting the env var skips all encryption. The raw key may leak via:
@@ -123,6 +137,7 @@ This CLI has been audited internally. Notable hardening:
 
 - **Slippage protection**: every market order computes `acceptablePrice` from the live oracle price ± `--slippage` bps. Orders without a resolvable mark price are refused.
 - **Strict symbol matching**: `BTC` does not match `BTCB`. Ambiguous symbols throw with the candidate list.
+- **Interactive y/N confirmation** before any signing operation in `trade long/short/close`. Aborts on `n` / empty / EOF. Bypass with `HZ_YES=1`.
 - **TX receipt confirmation**: `approve` and `multicall` both wait for receipt and abort the next step if reverted.
 - **No private key on argv**: `wallet import` and password prompts use raw-mode stdin so nothing lands in shell history or `ps`.
 - **Mainnet locked**: `getNetworkConfig('mainnet')` throws until the deployed addresses are populated.

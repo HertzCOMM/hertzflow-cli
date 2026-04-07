@@ -132,6 +132,63 @@ export async function promptSecretInput(prompt: string): Promise<string> {
   return promptPassword(prompt);
 }
 
+/**
+ * Visible y/N prompt. Returns true only if the user types "y" or "yes".
+ * Defaults to NO on empty / EOF / non-TTY (safe default for destructive ops).
+ * Set HZ_YES=1 to bypass — for non-interactive scripts that have already
+ * confirmed elsewhere.
+ */
+export async function promptConfirm(prompt: string): Promise<boolean> {
+  if (process.env.HZ_YES === '1') return true;
+  if (!process.stdin.isTTY) {
+    throw new Error('Confirmation required but stdin is not a TTY. Set HZ_YES=1 to bypass.');
+  }
+  process.stderr.write(`${prompt} [y/N]: `);
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const wasRaw = stdin.isRaw;
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding('utf-8');
+    let buf = '';
+    const onData = (ch: string) => {
+      if (ch === '\u0003') process.exit(130); // Ctrl-C
+      if (ch === '\n' || ch === '\r' || ch === '\u0004') {
+        stdin.setRawMode(wasRaw ?? false);
+        stdin.pause();
+        stdin.removeListener('data', onData);
+        process.stderr.write('\n');
+        const answer = buf.trim().toLowerCase();
+        resolve(answer === 'y' || answer === 'yes');
+      } else if (ch === '\u007f' || ch === '\b') {
+        if (buf.length > 0) {
+          buf = buf.slice(0, -1);
+          process.stderr.write('\b \b');
+        }
+      } else {
+        buf += ch;
+        process.stderr.write(ch);
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+/**
+ * Returns true if the keystore on disk uses the legacy 100k/keylen=32
+ * scheme (shared enc/mac key). Used to surface a startup warning so users
+ * re-encrypt with the hardened format.
+ */
+export function isLegacyKeystore(): boolean {
+  if (!keystoreExists()) return false;
+  try {
+    const ks: Keystore = JSON.parse(fs.readFileSync(KEYSTORE_PATH, 'utf-8'));
+    return ks.crypto.kdfparams.keylen === 32 || ks.crypto.kdfparams.iterations < 600_000;
+  } catch {
+    return false;
+  }
+}
+
 export function keystoreExists(): boolean {
   return fs.existsSync(KEYSTORE_PATH);
 }
